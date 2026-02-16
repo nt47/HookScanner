@@ -1,0 +1,511 @@
+#include "main.h"
+
+
+//获取进程的状态,排除僵尸进程
+//返回-1，表示发生异常
+//返回0，表示进程没有被挂起
+//返回1，表示进程处于挂起状态
+int GetProcessState(DWORD dwProcessID) {
+	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, dwProcessID);
+
+	if (hSnapshot != INVALID_HANDLE_VALUE) {
+		DWORD state = 1;//先置1，一旦有线程还在运行就置0
+		THREADENTRY32 te = { sizeof(te) };
+		BOOL fOk = Thread32First(hSnapshot, &te);
+		for (; fOk; fOk = Thread32Next(hSnapshot, &te)) {
+			if (te.th32OwnerProcessID == dwProcessID) {
+				HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+				DWORD suspendCount = SuspendThread(hThread);//返回之前的挂起数，大于0表示已挂起
+				ResumeThread(hThread);//马上恢复，这样不会对目标程序造成影响
+				CloseHandle(hThread);
+				if (suspendCount == 0) state = 0; //是个判断所有线程都挂起的好方法
+			}
+		}
+		CloseHandle(hSnapshot);
+		return state;
+	}
+	return -1;
+}
+
+
+
+
+
+// -----------------------------------------------------------------------------------
+// 进程线程部分
+// -----------------------------------------------------------------------------------
+
+// 通过进程名获取进程句柄
+// 参数: 
+//   processName - 进程名
+// 返回值:
+//   进程句柄
+HANDLE GetProcessHandleByName(PCHAR processName)
+{
+	// 初始化进程快照
+	PROCESSENTRY32 processEntry;
+	processEntry.dwSize = sizeof(PROCESSENTRY32);
+
+	// 获得快照句柄
+	HANDLE processSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+
+	// 获取第一个进程
+	Process32First(processSnap, &processEntry);
+	do
+	{
+		USES_CONVERSION;
+		if (strcmp(processName, W2A(processEntry.szExeFile)) == 0 && GetProcessState(processEntry.th32ProcessID)==0)
+		{
+
+			// 关闭快照句柄，避免内存泄漏
+			CloseHandle(processSnap);
+
+			// 返回句柄
+			return OpenProcess(PROCESS_ALL_ACCESS, FALSE, processEntry.th32ProcessID);
+		}
+	} while (Process32Next(processSnap, &processEntry));
+
+	// 关闭快照句柄，避免内存泄漏
+	CloseHandle(processSnap);
+	return (HANDLE)NULL;
+}
+
+// 根据进程名获取PID
+// 参数: 
+//   processName - 进程名
+// 返回值:
+//   进程ID
+DWORD64 GetProcessIDByName(LPCTSTR processName)
+{
+	DWORD64 processID = 0xFFFFFFFF;
+	HANDLE snapshot = INVALID_HANDLE_VALUE;
+	PROCESSENTRY32 processEntry;
+	processEntry.dwSize = sizeof(PROCESSENTRY32);
+
+	snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPALL, NULL);
+	Process32First(snapshot, &processEntry);
+	do
+	{
+		if (!_tcsicmp(processName, (LPCTSTR)processEntry.szExeFile) && GetProcessState(processEntry.th32ProcessID)==0)
+		{
+			processID = processEntry.th32ProcessID;
+			break;
+		}
+	} while (Process32Next(snapshot, &processEntry));
+
+	CloseHandle(snapshot);
+	return processID;
+}
+
+
+// 获取进程内所有模块信息
+// 参数: 
+//   processName - 进程名
+// 返回值:
+//   包含模块信息的向量
+std::vector<ModuleInfo> GetModuleInfoByProcessName(CHAR* processName)
+{
+	// 读取进程中的模块信息
+	MODULEENTRY32 moduleEntry;
+	USES_CONVERSION;
+	DWORD64 processID = GetProcessIDByName(A2W(processName));
+
+	std::cout << processID << std::endl;
+
+
+	// 存放模块路径
+	std::vector<ModuleInfo> moduleInfos = {};
+
+	// 在使用这个结构前，先设置它的大小
+	moduleEntry.dwSize = sizeof(MODULEENTRY32);
+
+	// 获取模块快照
+	HANDLE moduleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, processID);
+
+	// INVALID_HANDLE_VALUE表示无效的句柄
+	if (moduleSnap == INVALID_HANDLE_VALUE)
+	{
+		return{};
+	}
+
+	BOOL hasMoreModules = Module32First(moduleSnap, &moduleEntry);   // 获取第一个模块信息
+	char* modulePath = NULL;                                         // 模块路径
+	char* moduleName = NULL;                                         // 模块名
+	DWORD64 moduleBase = NULL;                                       // 模块基址
+
+	while (hasMoreModules)
+	{
+		ModuleInfo moduleInfo;
+
+		USES_CONVERSION;
+
+		// W2A 将wchar转ascii
+		modulePath = W2A(moduleEntry.szExePath);
+		moduleBase = (DWORD64)moduleEntry.modBaseAddr;
+		moduleName = W2A(moduleEntry.szModule);
+
+		// printf("模块路径: %s -> 模块基地址: %x -> 模块名: %s \n", ModulePath, ModuleBase, ModuleName);
+
+		strcpy_s(moduleInfo.modulePath, modulePath);
+		strcpy_s(moduleInfo.moduleName, moduleName);
+		moduleInfo.moduleBase = moduleBase;
+
+		// 放入容器内
+		moduleInfos.push_back(moduleInfo);
+		hasMoreModules = Module32Next(moduleSnap, &moduleEntry);
+	}
+
+	CloseHandle(moduleSnap);
+	return moduleInfos;
+}
+
+
+
+// -----------------------------------------------------------------------------------
+// PE文件读写部分
+// -----------------------------------------------------------------------------------
+
+// 读取硬盘PE文件数据
+// 参数: 
+//   filePath - 文件路径
+//   fileBuffer - 文件缓冲区指针
+// 返回值:
+//   文件大小
+DWORD64 ReadPEFile(LPSTR filePath, LPVOID* fileBuffer)
+{
+	FILE* file = NULL;
+
+	fopen_s(&file, filePath, "rb");
+	if (file == NULL)
+	{
+		return 0;
+	}
+	else
+	{
+		// 计算文件大小
+		fseek(file, 0, SEEK_END);
+		long long fileSize = ftell(file);
+		fseek(file, 0, SEEK_SET);
+
+		// 开辟指定大小的内存
+		LPVOID buffer = malloc(sizeof(char) * fileSize);
+		if (buffer == NULL)
+		{
+			fclose(file);
+			return 0;
+		}
+		// 将文件数据拷贝到缓冲区
+		size_t bytesRead = fread(buffer, sizeof(char), fileSize, file);
+		if (!bytesRead)
+		{
+			free(buffer);
+			fclose(file);
+			return 0;
+		}
+		*fileBuffer = buffer;
+		buffer = NULL;
+
+		fclose(file);
+		return fileSize;
+	}
+	return 0;
+}
+
+// 读取PE头信息
+// 参数: 
+//   fileBuffer - 文件缓冲区指针
+// 返回值:
+//   成功返回1，失败返回0
+DWORD64 ParsePEHeaders(LPVOID fileBuffer)
+{
+	if (fileBuffer == NULL)
+	{
+		// 缓冲区指针无效
+		return 0;
+	}
+
+	// 判断是否是有效的MZ标记
+	if (*((PWORD)fileBuffer) != IMAGE_DOS_SIGNATURE)
+	{
+		return 0;
+	}
+
+	dosHeader = (IMAGE_DOS_HEADER*)fileBuffer;
+
+	// 判断是否是有效的pe标志
+	if (*((PDWORD)((DWORD64)fileBuffer + dosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+	{
+		return 0;
+	}
+
+	ntHeader = (IMAGE_NT_HEADERS*)((DWORD64)fileBuffer + dosHeader->e_lfanew);                                       // NT头赋值
+	fileHeader = (IMAGE_FILE_HEADER*)((DWORD64)ntHeader + 4);                                                        // 标准PE头赋值
+	optionalHeader = (IMAGE_OPTIONAL_HEADER64*)((DWORD64)fileHeader + IMAGE_SIZEOF_FILE_HEADER);                     // 可选PE头赋值，标准PE头地址+标准PE头大小
+	sectionHeader = (IMAGE_SECTION_HEADER*)((DWORD64)optionalHeader + fileHeader->SizeOfOptionalHeader);             // 第一个节表 可选PE头地址+可选PE头大小
+	return 1;
+}
+
+// 拉伸PE结构
+// 参数: 
+//   fileBuffer - 硬盘状态的PE数据指针
+//   imageBuffer - 用来存放拉伸后的PE数据的指针
+// 返回值:
+//   PE镜像大小
+DWORD64 ExpandPEImageBuffer(LPVOID fileBuffer, LPVOID* imageBuffer)
+{
+	if (fileBuffer == NULL)
+	{
+		return 0;
+	}
+
+	// 申请ImageBuffer所需的内存空间
+	LPVOID buffer = malloc(sizeof(char) * optionalHeader->SizeOfImage);
+	if (buffer == NULL)
+	{
+		return 0;
+	}
+
+	memset(buffer, 0, optionalHeader->SizeOfImage);              // 将空间初始化为0
+	memcpy(buffer, fileBuffer, optionalHeader->SizeOfHeaders);  // 把头+节表+对齐的内存复制过去
+
+	// 复制节
+	for (int i = 0; i < fileHeader->NumberOfSections; i++)
+	{
+		buffer = (LPVOID)((DWORD64)buffer + (sectionHeader + i)->VirtualAddress);                     // 定位这个节内存中的偏移
+		fileBuffer = (LPVOID)((DWORD64)fileBuffer + (sectionHeader + i)->PointerToRawData);           // 定位这个节在文件中的偏移
+		memcpy(buffer, fileBuffer, (sectionHeader + i)->SizeOfRawData);                               // 复制节在文件中所占的内存过去
+		buffer = (LPVOID)((DWORD64)buffer - (sectionHeader + i)->VirtualAddress);                     // 恢复到起始位置
+		fileBuffer = (LPVOID)((DWORD64)fileBuffer - (sectionHeader + i)->PointerToRawData);           // 恢复到起始位置
+	}
+
+	*imageBuffer = buffer;
+	buffer = NULL;
+	return optionalHeader->SizeOfImage;
+}
+
+// 获取本程序代码段在内存中的起始地址和大小
+// 参数: 
+//   textInfo - 存放代码段信息的结构体指针
+// 返回值:
+//   代码段的数量
+DWORD64 GetCodeSectionInfo(PeTextInfo* textInfo)//没问题
+{
+	int length = 0;
+	for (int i = 0; i < fileHeader->NumberOfSections; i++)
+	{
+		// 判断是否是可执行的代码
+		if (((sectionHeader + i)->Characteristics & 0x20000000) == 0x20000000)
+		{
+			(textInfo + length)->virtualAddress = (sectionHeader + i)->VirtualAddress;
+			(textInfo + length)->pointerToRawData = (sectionHeader + i)->PointerToRawData;
+			(textInfo + length)->size = (sectionHeader + i)->SizeOfRawData;
+			length++;
+		}
+	}
+	return length;
+}
+
+bool GetCodeSectionInfoV2(PeTextInfo* textInfo)
+{
+	IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(ntHeader);
+	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++, section++)
+	{
+		if (strncmp((const char*)section->Name, ".text", 5) == 0)
+		{
+			textInfo->virtualAddress = section->VirtualAddress;
+			textInfo->pointerToRawData = section->PointerToRawData;
+			textInfo->size = section->SizeOfRawData;
+			return true; // 找到并成功返回
+		}
+	}
+	return false; // 如果未找到，返回false
+}
+
+
+// -----------------------------------------------------------------------------------
+// 反汇编部分
+// -----------------------------------------------------------------------------------
+
+// 反汇编字符串
+// 参数: 
+//   startOffset - 起始地址
+//   size - 代码大小
+// 返回值:
+//   包含反汇编信息的向量
+
+std::vector<DisassemblyInfo> DisassembleCode(unsigned char* startOffset, int size)
+{
+	std::vector<DisassemblyInfo> disassemblyInfos = {};
+
+	csh handle;
+	cs_insn* insn;
+	size_t count;
+
+	// 打开句柄
+	if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK)
+	{
+		return{};
+	}
+
+	// 反汇编代码,地址从0x0开始,返回总条数
+	count = cs_disasm(handle, (unsigned char*)startOffset, size, 0x0, 0, &insn);
+
+	if (count > 0)
+	{
+		DWORD index;
+
+		// 循环反汇编代码
+		for (index = 0; index < count; index++)
+		{
+			// 清空
+			DisassemblyInfo disasmInfo;
+			memset(&disasmInfo, 0, sizeof(DisassemblyInfo));
+
+			// 循环拷贝机器码
+			for (int x = 0; x < insn[index].size; x++)
+			{
+				disasmInfo.opCode[x] = insn[index].bytes[x];
+			}
+
+			// 拷贝地址长度
+			disasmInfo.address = insn[index].address;
+			disasmInfo.opCodeSize = insn[index].size;
+
+			// 拷贝反汇编指令
+			strcpy_s(disasmInfo.opString, insn[index].mnemonic);
+			strcat_s(disasmInfo.opString, " ");
+			strcat_s(disasmInfo.opString, insn[index].op_str);
+
+			// 得到反汇编长度
+			disasmInfo.opStringSize = (int)strlen(disasmInfo.opString);
+
+			disassemblyInfos.push_back(disasmInfo);
+		}
+		cs_free(insn, count);
+	}
+	else
+	{
+		return{};
+	}
+	cs_close(&handle);
+	return disassemblyInfos;
+}
+
+
+int main(int argc, char* argv[])
+{
+	DWORD64 fileSize = 0;
+	LPVOID fileBuffer = NULL;
+
+	// 从完整路径中获取文件名
+	CHAR fullPath[256] = { 0 };
+	CHAR fileName[64] = { 0 }, * p = NULL;
+
+	strcpy_s(fullPath, "C:\\Users\\Pudge\\source\\repos\\Misc\\AnywhereHook64\\x64\\Release\\Victim.exe");
+	strcpy_s(fileName, (p = strrchr(fullPath, '\\')) ? p + 1 : fullPath);
+
+	// 打开进程
+	HANDLE processHandle = GetProcessHandleByName(fileName);
+
+
+	printf("fullPath: %s \nfileName:%s \n", fullPath, fileName);
+
+	// 循环输出所有模块信息
+	std::vector<ModuleInfo> moduleInfos = GetModuleInfoByProcessName(fileName);
+
+	printf("moduleSiz is %d\n", moduleInfos.size());
+
+	for (int i = 0; i < moduleInfos.size(); i++)
+	{
+		if (strcmp(moduleInfos[i].moduleName, fileName) == 0)
+		{
+			printf("[*] 模块基地址: 0x%I64X | 模块路径: %s \n", moduleInfos[i].moduleBase, moduleInfos[i].modulePath);
+
+			// 读取磁盘PE文件
+			fileSize = ReadPEFile(moduleInfos[i].modulePath, &fileBuffer);
+
+			// 解析PE头
+			DWORD64 ref = ParsePEHeaders(fileBuffer);
+
+			// 拉伸PE
+			LPVOID imageBuffer = NULL;
+			DWORD64 sizeOfImage = ExpandPEImageBuffer(fileBuffer, &imageBuffer);//正常
+
+
+			std::cout <<"sizeOfImage: "<< std::hex << sizeOfImage << std::endl;
+
+			// 获取.text节地址
+			PeTextInfo textInfo;
+			DWORD64 textSectionCount = GetCodeSectionInfoV2(&textInfo);
+
+			std::cout << ".text size: " << textInfo.size << std::endl;//没问题
+
+			std::cout << "virtualAddress: " << textInfo.virtualAddress << std::endl;//没问题
+
+			// 读入磁盘数据
+			unsigned char* fileTextBuffer = NULL;
+			fileTextBuffer = (unsigned char*)malloc((textInfo.size));
+			memcpy(fileTextBuffer, (unsigned char*)((DWORD64)imageBuffer + textInfo.virtualAddress), textInfo.size);
+
+			// 读入内存数据
+			unsigned char* memoryTextBuffer = NULL;
+			DWORD64 protectTemp = NULL;
+
+			DWORD64 moduleBase = moduleInfos[i].moduleBase;
+
+			memoryTextBuffer = (unsigned char*)malloc(textInfo.size);
+
+
+			for (int j = 0; j < textInfo.size; j++)
+			{
+				ReadProcessMemory(processHandle, (LPVOID)(moduleBase + textInfo.virtualAddress), memoryTextBuffer, sizeof(char) * textInfo.size, NULL);
+			}
+
+			// 开始反汇编
+			std::vector<DisassemblyInfo> fileDisassembly = DisassembleCode(fileTextBuffer, textInfo.size);
+			std::vector<DisassemblyInfo> memoryDisassembly = DisassembleCode(memoryTextBuffer, textInfo.size);
+
+			for (int k = 0; k < fileDisassembly.size(); k++)
+			{
+				//printf("0x%I64X | ", moduleBase + memoryDisassembly[k].address);
+				//printf("文件汇编: %-45s | ", fileDisassembly[k].opString);
+				//printf("内存汇编: %-45s | ", memoryDisassembly[k].opString);
+
+				// 开始对比
+				if (memcmp(fileDisassembly[k].opCode, memoryDisassembly[k].opCode, fileDisassembly[k].opCodeSize) != 0)
+				{
+
+
+					if (memoryDisassembly[k].opCode[0] == 0xFF && memoryDisassembly[k].opCode[1] == 0xE0)
+					{
+						printf("0x%I64X | ", moduleBase + textInfo.virtualAddress+memoryDisassembly[k].address);//有问题要加textInfo.virtualAddress
+						printf("文件汇编: %-45s | ", fileDisassembly[k].opString);
+						printf("内存汇编: %-45s | ", memoryDisassembly[k].opString);
+						// 被挂钩
+						printf("文件=> ");
+						for (int l = 0; l < fileDisassembly[k].opCodeSize; l++)
+						{
+							printf("0x%02X ", fileDisassembly[k].opCode[l]);
+						}
+						printf(" 内存=> ");
+						for (int m = 0; m < memoryDisassembly[k].opCodeSize; m++)
+						{
+							printf("0x%02X ", memoryDisassembly[k].opCode[m]);
+						}
+						printf("\n");
+					}
+				}
+				//printf("\n");
+			}
+
+			// 释放
+			imageBuffer = NULL;
+			free(fileBuffer);
+			free(fileTextBuffer);
+			free(memoryTextBuffer);
+		}
+	}
+
+	system("pause");
+	return 0;
+}
